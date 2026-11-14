@@ -240,6 +240,123 @@ export async function subscribeWabaToApp(
   }
 }
 
+export interface ExchangeSignupCodeArgs {
+  /** The `code` FB.login returned to the Embedded Signup popup. */
+  code: string
+  appId: string
+  appSecret: string
+}
+
+/**
+ * Trade an Embedded Signup `code` for a business integration system
+ * user access token scoped to the customer's WhatsApp assets. The code
+ * is single-use and short-lived (about 30 seconds), so call this as
+ * soon as the browser posts it. Embedded Signup needs no redirect_uri.
+ */
+export async function exchangeEmbeddedSignupCode(
+  args: ExchangeSignupCodeArgs
+): Promise<string> {
+  const params = new URLSearchParams({
+    client_id: args.appId,
+    client_secret: args.appSecret,
+    code: args.code,
+  })
+  const response = await fetch(`${META_API_BASE}/oauth/access_token?${params}`)
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`)
+  }
+  const data = (await response.json()) as { access_token?: string }
+  if (!data.access_token) {
+    throw new MetaApiError('Meta returned no access token for the signup code', {
+      httpStatus: response.status,
+    })
+  }
+  return data.access_token
+}
+
+export type SmbAppDataSyncType = 'smb_app_state_sync' | 'history'
+
+export interface RequestSmbAppDataSyncArgs {
+  phoneNumberId: string
+  accessToken: string
+  syncType: SmbAppDataSyncType
+}
+
+/**
+ * Ask Meta to send a coexistence number's WhatsApp Business app data:
+ * `smb_app_state_sync` (contacts) or `history` (past chats). Allowed
+ * once per type, within 24 hours of onboarding, by the app that
+ * onboarded the number. The data arrives later on the
+ * `smb_app_state_sync` / `history` webhooks; the response only carries
+ * a request id, and does NOT say whether the business chose to share
+ * its history.
+ */
+export async function requestSmbAppDataSync(
+  args: RequestSmbAppDataSyncArgs
+): Promise<void> {
+  const { phoneNumberId, accessToken, syncType } = args
+  const response = await fetch(`${META_API_BASE}/${phoneNumberId}/smb_app_data`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ messaging_product: 'whatsapp', sync_type: syncType }),
+  })
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`)
+  }
+}
+
+/**
+ * The `granular_scopes` of a token, via Graph's /debug_token with an
+ * app access token. Lists which WhatsApp Business Accounts an Embedded
+ * Signup token was granted.
+ */
+export async function getTokenGranularScopes(args: {
+  inputToken: string
+  appId: string
+  appSecret: string
+}): Promise<{ scope?: string; target_ids?: string[] }[]> {
+  const params = new URLSearchParams({
+    input_token: args.inputToken,
+    access_token: `${args.appId}|${args.appSecret}`,
+  })
+  const response = await fetch(`${META_API_BASE}/debug_token?${params}`)
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`)
+  }
+  const data = (await response.json()) as {
+    data?: { granular_scopes?: { scope?: string; target_ids?: string[] }[] }
+  }
+  return data.data?.granular_scopes ?? []
+}
+
+/**
+ * Whether a number is also live in the WhatsApp Business app
+ * (coexistence). `isOnBizApp` is null when Meta doesn't say.
+ */
+export async function getPhoneNumberPlatform(args: {
+  phoneNumberId: string
+  accessToken: string
+}): Promise<{ isOnBizApp: boolean | null; platformType: string | null }> {
+  const response = await fetch(
+    `${META_API_BASE}/${args.phoneNumberId}?fields=is_on_biz_app,platform_type`,
+    { headers: { Authorization: `Bearer ${args.accessToken}` } }
+  )
+  if (!response.ok) {
+    await throwMetaError(response, `Meta API error: ${response.status}`)
+  }
+  const data = (await response.json()) as {
+    is_on_biz_app?: boolean
+    platform_type?: string
+  }
+  return {
+    isOnBizApp: typeof data.is_on_biz_app === 'boolean' ? data.is_on_biz_app : null,
+    platformType: data.platform_type ?? null,
+  }
+}
+
 export interface ListWabaPhoneNumbersArgs {
   wabaId: string
   accessToken: string

@@ -311,7 +311,7 @@ vi.mock('@/lib/webhooks/deliver', () => ({
   dispatchWebhookEvent: h.dispatchWebhookEvent,
 }))
 
-import { POST } from './route'
+import { GET, POST } from './route'
 import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
 import { findExistingContact } from '@/lib/contacts/dedupe'
 import { handleTemplateWebhookChange } from '@/lib/whatsapp/template-webhook'
@@ -1290,5 +1290,29 @@ describe('coexistence: address book from the WhatsApp Business app', () => {
     expect(h.state.contactUpdates).toHaveLength(0)
     // The removal never even looks the number up.
     expect(mockFindExistingContact).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('webhook handshake: deployment-wide verify token', () => {
+  const handshake = (token: string) =>
+    GET({
+      url: `https://crm.test/api/whatsapp/webhook?hub.mode=subscribe&hub.challenge=42&hub.verify_token=${token}`,
+    } as unknown as Request)
+
+  it('answers the challenge when META_WEBHOOK_VERIFY_TOKEN matches', async () => {
+    vi.stubEnv('META_WEBHOOK_VERIFY_TOKEN', 'env-token')
+    const res = (await handshake('env-token')) as Response
+    expect(res.status).toBe(200)
+    expect(await res.text()).toBe('42')
+    vi.unstubAllEnvs()
+  })
+
+  it('does not accept a different token on the env path', async () => {
+    vi.stubEnv('META_WEBHOOK_VERIFY_TOKEN', 'env-token')
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const res = (await handshake('env-tokem')) as unknown as { init?: { status?: number } }
+    expect(res.init?.status).toBe(403)
+    errorSpy.mockRestore()
+    vi.unstubAllEnvs()
   })
 })

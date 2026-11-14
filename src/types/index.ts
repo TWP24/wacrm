@@ -317,6 +317,19 @@ export interface WhatsAppConfig {
    * inbound attachments expire. Migration 039.
    */
   mirror_inbound_media?: boolean;
+  /**
+   * The number is also live in the WhatsApp Business app (Meta
+   * "coexistence"). Registered by Meta's onboarding flow — never call
+   * /register on it. Migration 043.
+   */
+  coexistence?: boolean;
+  /** 'manual' (pasted credentials) or 'embedded_signup'. Migration 043. */
+  onboarded_via?: 'manual' | 'embedded_signup';
+  /** When wacrm asked Meta for the app's contacts / chat history. */
+  smb_contacts_sync_requested_at?: string | null;
+  smb_history_sync_requested_at?: string | null;
+  /** Why the last contacts / history request failed. */
+  smb_sync_error?: string | null;
 }
 
 // Raw Meta status enum. We persist this verbatim from Meta (sync + webhook)

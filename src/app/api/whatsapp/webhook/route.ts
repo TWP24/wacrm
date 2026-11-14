@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto'
 import { NextResponse, after } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption'
@@ -181,6 +182,15 @@ interface WhatsAppWebhookEntry {
   }>
 }
 
+/** Constant-time compare against META_WEBHOOK_VERIFY_TOKEN, when set. */
+function matchesEnvVerifyToken(candidate: string): boolean {
+  const expected = process.env.META_WEBHOOK_VERIFY_TOKEN?.trim()
+  if (!expected) return false
+  const a = Buffer.from(candidate)
+  const b = Buffer.from(expected)
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
 // GET - Webhook verification
 export async function GET(request: Request) {
   try {
@@ -194,6 +204,17 @@ export async function GET(request: Request) {
         { error: 'Missing verification parameters' },
         { status: 400 }
       )
+    }
+
+    // A deployment-wide token (META_WEBHOOK_VERIFY_TOKEN) also works.
+    // Connecting with the Embedded Signup button stores no per-account
+    // verify token, so this is what the Meta App's webhook settings use
+    // in that setup.
+    if (matchesEnvVerifyToken(verifyToken)) {
+      return new Response(challenge, {
+        status: 200,
+        headers: { 'Content-Type': 'text/plain' },
+      })
     }
 
     // Fetch all whatsapp configs to check verify tokens

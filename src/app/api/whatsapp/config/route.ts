@@ -395,7 +395,7 @@ export async function POST(request: Request) {
     // rather than null it out.
     const { data: existing } = await supabase
       .from('whatsapp_config')
-      .select('id, registered_at, phone_number_id, verify_token')
+      .select('id, registered_at, phone_number_id, verify_token, coexistence')
       .eq('account_id', accountId)
       .maybeSingle()
 
@@ -439,7 +439,16 @@ export async function POST(request: Request) {
     // is not a failure, just an incomplete-but-valid save.
     let registrationSkipped = false
 
-    const needsRegistration = !sameNumber || (typeof pin === 'string' && pin.length > 0)
+    // A number that is also live in the WhatsApp Business app
+    // (coexistence, migration 043) was registered by Meta's onboarding
+    // flow. /register would move it off the phone app, so never call it
+    // for that number, PIN or not.
+    const isCoexistenceNumber =
+      existing?.coexistence === true && existing?.phone_number_id === phone_number_id
+
+    const needsRegistration =
+      !isCoexistenceNumber &&
+      (!sameNumber || (typeof pin === 'string' && pin.length > 0))
     if (needsRegistration) {
       if (!pin) {
         // No PIN provided. Meta TEST numbers (Developer Console) are
@@ -510,6 +519,16 @@ export async function POST(request: Request) {
       registered_at: registrationError ? null : registeredAt,
       subscribed_apps_at: subscribedAppsAt ?? null,
       last_registration_error: registrationError,
+      // Saving a different number by hand ends any coexistence setup.
+      ...(existing && existing.phone_number_id !== phone_number_id
+        ? {
+            coexistence: false,
+            onboarded_via: 'manual',
+            smb_contacts_sync_requested_at: null,
+            smb_history_sync_requested_at: null,
+            smb_sync_error: null,
+          }
+        : {}),
       updated_at: new Date().toISOString(),
     }
 

@@ -24,6 +24,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Switch } from '@/components/ui/switch';
 import { SettingsPanelHead } from './settings-panel-head';
+import { WhatsAppEmbeddedSignup } from './whatsapp-embedded-signup';
 import {
   Accordion,
   AccordionItem,
@@ -548,6 +549,16 @@ export function WhatsAppConfig() {
       <div className="grid gap-6 lg:grid-cols-[1fr_380px]">
       {/* Main config form */}
       <div className="space-y-6">
+        {/* One-click Meta Embedded Signup (hidden unless configured) */}
+        {canEditSettings && (
+          <WhatsAppEmbeddedSignup
+            config={config}
+            onConnected={async () => {
+              if (accountId) await fetchConfig(accountId);
+            }}
+          />
+        )}
+
         {/* Corrupted-token reset banner */}
         {showResetBanner && (
           <Alert className="bg-amber-950/40 border-amber-600/40">
