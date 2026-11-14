@@ -159,9 +159,9 @@ Key pages:
 - [Architecture](https://wacrm.tech/docs/architecture)
 - [Troubleshooting](https://wacrm.tech/docs/troubleshooting)
 - [WhatsApp connection troubleshooting](./docs/whatsapp-connection-troubleshooting.md)
-- [Use your WhatsApp Business app number (coexistence)](./docs/whatsapp-coexistence.md) — keep chatting from your phone; app replies, chat history and contacts sync into the CRM.
   — what each "Save Configuration" error means, and the Meta code /
   trace id to quote to Meta support
+- [Use your WhatsApp Business app number (coexistence)](./docs/whatsapp-coexistence.md) — keep chatting from your phone; app replies, chat history and contacts sync into the CRM.
 - [Several WABAs on one deployment](./docs/multi-waba.md) — one Meta
   App or several; how `META_APP_SECRET` takes a comma-separated list
 - [Auth emails](./docs/auth-emails.md) — what Supabase must allow so
