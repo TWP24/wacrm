@@ -41,6 +41,10 @@ const h = vi.hoisted(() => ({
     broadcastRecipient: null as { id: string; status: string } | null,
     /** Patches applied to that broadcast_recipients row. */
     recipientUpdates: [] as Record<string, unknown>[],
+    /** Patches applied to `conversations`, with any `.or()` guard. */
+    conversationUpdates: [] as { patch: Record<string, unknown>; or?: string }[],
+    /** Patches applied to `flow_runs`. */
+    flowRunUpdates: [] as Record<string, unknown>[],
   },
 }))
 
@@ -74,9 +78,36 @@ vi.mock('@supabase/supabase-js', () => ({
                 }),
             }),
           }
+        case 'flow_runs':
+          // Pause on an app reply: update().eq().eq().eq()
+          return {
+            update: (patch: Record<string, unknown>) => {
+              h.state.flowRunUpdates.push(patch)
+              const chain = {
+                eq: () => chain,
+                then: (resolve: (v: { error: null }) => unknown) =>
+                  resolve({ error: null }),
+              }
+              return chain
+            },
+          }
         case 'conversations':
           // findOrCreateConversation: select().eq().eq().order().limit()
+          // last-message refresh:     update().eq() [.or()]
           return {
+            update: (patch: Record<string, unknown>) => {
+              const entry: { patch: Record<string, unknown>; or?: string } = { patch }
+              h.state.conversationUpdates.push(entry)
+              return {
+                eq: () =>
+                  Object.assign(Promise.resolve({ error: null }), {
+                    or: (filter: string) => {
+                      entry.or = filter
+                      return Promise.resolve({ error: null })
+                    },
+                  }),
+              }
+            },
             select: () => ({
               eq: () => ({
                 eq: () => ({
@@ -199,16 +230,17 @@ vi.mock('@supabase/supabase-js', () => ({
               h.state.messageUpdates.push(patch)
               return { eq: () => Promise.resolve({ error: null }) }
             },
-            // Idempotent insert: upsert(...).select('id')
+            // Idempotent insert: upsert(...).select('id'), or a bare
+            // awaited upsert(rows) for a history batch.
             upsert: (row: Record<string, unknown>, options: unknown) => {
               h.state.upsertCalls.push({ row, options })
-              return {
+              return Object.assign(Promise.resolve({ error: null }), {
                 select: () =>
                   Promise.resolve({
                     data: h.state.messageUpsertResult,
                     error: null,
                   }),
-              }
+              })
             },
           }
         default:
@@ -379,6 +411,8 @@ beforeEach(() => {
   h.state.messageUpdates = []
   h.state.broadcastRecipient = null
   h.state.recipientUpdates = []
+  h.state.conversationUpdates = []
+  h.state.flowRunUpdates = []
   mockFindExistingContact.mockResolvedValue({
     id: 'contact-1',
     name: 'Ada',
@@ -1010,5 +1044,251 @@ describe('status webhook: failed statuses keep Meta\'s reason (#535)', () => {
     expect(h.state.recipientUpdates).toHaveLength(1)
     expect(h.state.recipientUpdates[0]).not.toHaveProperty('error_message')
     expect(h.state.recipientUpdates[0]).not.toHaveProperty('error_code')
+  })
+})
+
+// ============================================================
+// Coexistence: the number is also live in the WhatsApp Business app
+// ============================================================
+
+/** A webhook carrying one change on `field` with `value`. */
+async function runFieldWebhook(field: string, value: Record<string, unknown>) {
+  const body = {
+    entry: [
+      {
+        id: 'waba-1',
+        changes: [
+          {
+            field,
+            value: {
+              messaging_product: 'whatsapp',
+              metadata: {
+                display_phone_number: '353 1 555 0100',
+                phone_number_id: 'pn-1',
+              },
+              ...value,
+            },
+          },
+        ],
+      },
+    ],
+  }
+  const res = await POST({
+    text: async () => JSON.stringify(body),
+    headers: { get: () => 'sha256=stub' },
+  } as unknown as Request)
+  for (const cb of h.state.afterCallbacks) await cb()
+  return res
+}
+
+const ECHO = {
+  from: '35315550100',
+  to: '15551230000',
+  id: 'wamid.ECHO1',
+  timestamp: '1700000100',
+  type: 'text',
+  text: { body: 'Thanks, got it' },
+}
+
+describe('coexistence: messages sent from the WhatsApp Business app', () => {
+  it('stores the echo as an agent message in the customer\'s thread', async () => {
+    await runFieldWebhook('smb_message_echoes', { message_echoes: [ECHO] })
+
+    // The customer is the recipient, not the sender.
+    expect(mockFindExistingContact).toHaveBeenCalledWith(
+      expect.anything(),
+      'acc-1',
+      '15551230000'
+    )
+    expect(h.state.upsertCalls).toHaveLength(1)
+    expect(h.state.upsertCalls[0].row).toMatchObject({
+      conversation_id: 'conv-1',
+      sender_type: 'agent',
+      content_type: 'text',
+      content_text: 'Thanks, got it',
+      message_id: 'wamid.ECHO1',
+      status: 'sent',
+      created_at: new Date(1700000100 * 1000).toISOString(),
+    })
+    expect(h.state.upsertCalls[0].options).toMatchObject({
+      onConflict: 'conversation_id,message_id',
+      ignoreDuplicates: true,
+    })
+    expect(h.state.conversationUpdates[0].patch).toMatchObject({
+      last_message_text: 'Thanks, got it',
+    })
+  })
+
+  it('never bumps unread or fires automations, flows, AI or message.received', async () => {
+    await runFieldWebhook('smb_message_echoes', { message_echoes: [ECHO] })
+
+    expect(h.state.rpcCalls).toHaveLength(0)
+    expect(h.runAutomationsForTrigger).not.toHaveBeenCalled()
+    expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
+    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+    expect(h.dispatchWebhookEvent).not.toHaveBeenCalled()
+  })
+
+  it('pauses an active flow run, like a reply from the inbox', async () => {
+    await runFieldWebhook('smb_message_echoes', { message_echoes: [ECHO] })
+
+    expect(h.state.flowRunUpdates).toEqual([
+      expect.objectContaining({ status: 'paused_by_agent', end_reason: 'agent_replied' }),
+    ])
+  })
+
+  it('a replayed echo writes nothing after the idempotent insert', async () => {
+    h.state.messageUpsertResult = []
+
+    await runFieldWebhook('smb_message_echoes', { message_echoes: [ECHO] })
+
+    expect(h.state.upsertCalls).toHaveLength(1)
+    expect(h.state.conversationUpdates).toHaveLength(0)
+    expect(h.state.flowRunUpdates).toHaveLength(0)
+  })
+
+  it('skips reactions tapped on the phone', async () => {
+    await runFieldWebhook('smb_message_echoes', {
+      message_echoes: [
+        { ...ECHO, type: 'reaction', reaction: { message_id: 'wamid.X', emoji: '👍' } },
+      ],
+    })
+
+    expect(h.state.upsertCalls).toHaveLength(0)
+  })
+})
+
+describe('coexistence: chat history from the WhatsApp Business app', () => {
+  const HISTORY = [
+    {
+      metadata: { phase: 0, chunk_order: 1, progress: 100 },
+      threads: [
+        {
+          id: '15551230000',
+          messages: [
+            {
+              from: '15551230000',
+              id: 'wamid.H1',
+              timestamp: '1690000000',
+              type: 'text',
+              text: { body: 'Here is my receipt' },
+              history_context: { status: 'READ' },
+            },
+            {
+              from: '35315550100',
+              to: '15551230000',
+              id: 'wamid.H2',
+              timestamp: '1690000100',
+              type: 'image',
+              image: { id: 'media-9', mime_type: 'image/jpeg' },
+              history_context: { status: 'DELIVERED' },
+            },
+          ],
+        },
+      ],
+    },
+  ]
+
+  it('imports both sides of the thread in one idempotent batch', async () => {
+    await runFieldWebhook('history', { history: HISTORY })
+
+    expect(h.state.upsertCalls).toHaveLength(1)
+    const rows = h.state.upsertCalls[0].row as unknown as Record<string, unknown>[]
+    expect(rows).toEqual([
+      expect.objectContaining({
+        sender_type: 'customer',
+        content_text: 'Here is my receipt',
+        message_id: 'wamid.H1',
+        status: 'read',
+      }),
+      expect.objectContaining({
+        sender_type: 'agent',
+        content_type: 'image',
+        message_id: 'wamid.H2',
+        status: 'delivered',
+        // Lazy proxy path — no Meta call while importing history.
+        media_url: '/api/whatsapp/media/media-9',
+        media_type: 'image/jpeg',
+      }),
+    ])
+    expect(h.state.upsertCalls[0].options).toMatchObject({
+      onConflict: 'conversation_id,message_id',
+      ignoreDuplicates: true,
+    })
+    expect(mockGetMediaUrl).not.toHaveBeenCalled()
+  })
+
+  it('is imported quietly and only moves the inbox preview forward', async () => {
+    await runFieldWebhook('history', { history: HISTORY })
+
+    expect(h.state.rpcCalls).toHaveLength(0)
+    expect(h.runAutomationsForTrigger).not.toHaveBeenCalled()
+    expect(h.dispatchInboundToFlows).not.toHaveBeenCalled()
+    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+    expect(h.dispatchWebhookEvent).not.toHaveBeenCalled()
+
+    const newest = new Date(1690000100 * 1000).toISOString()
+    expect(h.state.conversationUpdates).toEqual([
+      {
+        patch: expect.objectContaining({ last_message_text: '[image]', last_message_at: newest }),
+        or: `last_message_at.is.null,last_message_at.lt.${newest}`,
+      },
+    ])
+  })
+
+  it('logs and skips a chunk when history sharing was turned off in the app', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    await runFieldWebhook('history', {
+      history: [
+        {
+          errors: [
+            {
+              code: 2593109,
+              title: 'History sync is turned off by the business from the WhatsApp Business App',
+            },
+          ],
+        },
+      ],
+    })
+
+    expect(h.state.upsertCalls).toHaveLength(0)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('history sharing is turned off'))
+    warn.mockRestore()
+  })
+})
+
+describe('coexistence: address book from the WhatsApp Business app', () => {
+  it('adds a contact the CRM does not know yet, named from the phone', async () => {
+    mockFindExistingContact.mockResolvedValue(null)
+
+    await runFieldWebhook('smb_app_state_sync', {
+      state_sync: [
+        {
+          type: 'contact',
+          contact: { full_name: 'Bríd Murphy', first_name: 'Bríd', phone_number: '+353 87 000 0000' },
+          action: 'add',
+          metadata: { timestamp: '1700000000' },
+        },
+      ],
+    })
+
+    expect(h.state.contactInserts).toEqual([
+      { account_id: 'acc-1', user_id: 'user-1', phone: '353870000000', name: 'Bríd Murphy' },
+    ])
+  })
+
+  it('never renames an existing contact or deletes one on remove', async () => {
+    await runFieldWebhook('smb_app_state_sync', {
+      state_sync: [
+        { type: 'contact', contact: { full_name: 'Someone Else', phone_number: '15551230000' }, action: 'add' },
+        { type: 'contact', contact: { full_name: 'Gone', phone_number: '15559990000' }, action: 'remove' },
+      ],
+    })
+
+    expect(h.state.contactInserts).toHaveLength(0)
+    expect(h.state.contactUpdates).toHaveLength(0)
+    // The removal never even looks the number up.
+    expect(mockFindExistingContact).toHaveBeenCalledTimes(1)
   })
 })

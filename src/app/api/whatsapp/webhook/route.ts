@@ -22,6 +22,16 @@ import {
   handleTemplateWebhookChange,
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook'
+import {
+  HISTORY_SHARING_DECLINED,
+  customerIdentityPayload,
+  historyMessageStatus,
+  isCoexistenceWebhookField,
+  isSentByBusiness,
+  metaTimestampToIso,
+  stateSyncContactName,
+  storedContentType,
+} from '@/lib/whatsapp/coexistence'
 
 // The `after()` callback in POST runs within this route's max duration.
 // Inbound processing can fan out to per-media Meta verification calls, so
@@ -90,6 +100,39 @@ interface WhatsAppMessage {
   context?: { id: string }
 }
 
+/**
+ * A message the business sent from the WhatsApp Business app on a
+ * coexistence number (`smb_message_echoes`). Same shape as an inbound
+ * message, but `from` is the business and `to` is the customer.
+ */
+interface WhatsAppEchoMessage extends WhatsAppMessage {
+  to?: string
+  to_user_id?: string
+}
+
+/** One message inside a `history` webhook thread. */
+interface WhatsAppHistoryMessage extends WhatsAppMessage {
+  /** Present only on business-sent (echo) entries. */
+  to?: string
+  history_context?: { status?: string }
+}
+
+/** One `history` chunk. Either `threads` or `errors` is set. */
+interface WhatsAppHistoryChunk {
+  metadata?: { phase?: number; chunk_order?: number; progress?: number }
+  /** Thread `id` is the customer's phone number (or BSUID). */
+  threads?: Array<{ id: string; messages?: WhatsAppHistoryMessage[] }>
+  errors?: MetaStatusError[]
+}
+
+/** One `smb_app_state_sync` item — an address-book change in the app. */
+interface WhatsAppStateSyncItem {
+  type?: string
+  contact?: { full_name?: string; first_name?: string; phone_number?: string }
+  action?: string
+  metadata?: { timestamp?: string }
+}
+
 /** One entry of a failed status's `errors` array, as Meta sends it. */
 interface MetaStatusError {
   code: number
@@ -129,6 +172,10 @@ interface WhatsAppWebhookEntry {
          */
         errors?: MetaStatusError[]
       }>
+      /** Coexistence fields — see `@/lib/whatsapp/coexistence`. */
+      message_echoes?: WhatsAppEchoMessage[]
+      history?: WhatsAppHistoryChunk[]
+      state_sync?: WhatsAppStateSyncItem[]
     }
     field: string
   }>
@@ -297,47 +344,35 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         }
       }
 
+      // Coexistence: the same number is also live in the WhatsApp
+      // Business app. Messages typed on the phone, past chats and the
+      // phone's address book arrive on their own fields.
+      if (isCoexistenceWebhookField(change.field)) {
+        const config = await loadConfigForPhoneNumber(
+          value.metadata?.phone_number_id
+        )
+        if (!config) continue
+        if (change.field === 'smb_message_echoes') {
+          await handleMessageEchoes(value.message_echoes ?? [], config)
+        } else if (change.field === 'history') {
+          await handleHistory(
+            value.history ?? [],
+            value.metadata?.display_phone_number,
+            config
+          )
+        } else {
+          await handleStateSync(value.state_sync ?? [], config)
+        }
+        continue
+      }
+
       // Handle incoming messages
       if (!value.messages || !value.contacts) continue
 
-      const phoneNumberId = value.metadata.phone_number_id
-
-      // Find user's config by phone_number_id. `.single()` returns
-      // PGRST116 for both 0 rows AND ≥2 rows — distinguish them so
-      // operators see the real cause in logs. ≥2 rows shouldn't happen
-      // post-migration 013 (UNIQUE constraint), but a row created
-      // before the constraint, or a race, would still surface here.
-      const { data: configRows, error: configError } = await supabaseAdmin()
-        .from('whatsapp_config')
-        .select('*')
-        .eq('phone_number_id', phoneNumberId)
-
-      if (configError) {
-        console.error(
-          'Error fetching whatsapp_config for phone_number_id:',
-          phoneNumberId,
-          configError
-        )
-        continue
-      }
-
-      if (!configRows || configRows.length === 0) {
-        console.error('No config found for phone_number_id:', phoneNumberId)
-        continue
-      }
-
-      if (configRows.length > 1) {
-        console.error(
-          `Multiple configs (${configRows.length}) found for phone_number_id:`,
-          phoneNumberId,
-          '— inbound message dropped. Resolve duplicates so each number maps to a single account.',
-          'Account owners:',
-          configRows.map((r: { account_id: string; user_id: string }) => `${r.account_id} (admin ${r.user_id})`)
-        )
-        continue
-      }
-
-      const config = configRows[0]
+      const config = await loadConfigForPhoneNumber(
+        value.metadata.phone_number_id
+      )
+      if (!config) continue
 
       const decryptedAccessToken = decrypt(config.access_token)
 
@@ -362,6 +397,386 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
           config.mirror_inbound_media !== false
         )
       }
+    }
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type WhatsAppConfigRow = any
+
+/**
+ * The whatsapp_config row that owns a phone_number_id, or null (logged).
+ * `.single()` returns PGRST116 for both 0 rows AND ≥2 rows — distinguish
+ * them so operators see the real cause in logs. ≥2 rows shouldn't happen
+ * post-migration 013 (UNIQUE constraint), but a row created before the
+ * constraint, or a race, would still surface here.
+ */
+async function loadConfigForPhoneNumber(
+  phoneNumberId: string | undefined
+): Promise<WhatsAppConfigRow | null> {
+  if (!phoneNumberId) {
+    console.error('[webhook] delivery carries no phone_number_id; skipping')
+    return null
+  }
+
+  const { data: configRows, error: configError } = await supabaseAdmin()
+    .from('whatsapp_config')
+    .select('*')
+    .eq('phone_number_id', phoneNumberId)
+
+  if (configError) {
+    console.error(
+      'Error fetching whatsapp_config for phone_number_id:',
+      phoneNumberId,
+      configError
+    )
+    return null
+  }
+
+  if (!configRows || configRows.length === 0) {
+    console.error('No config found for phone_number_id:', phoneNumberId)
+    return null
+  }
+
+  if (configRows.length > 1) {
+    console.error(
+      `Multiple configs (${configRows.length}) found for phone_number_id:`,
+      phoneNumberId,
+      '— inbound message dropped. Resolve duplicates so each number maps to a single account.',
+      'Account owners:',
+      configRows.map((r: { account_id: string; user_id: string }) => `${r.account_id} (admin ${r.user_id})`)
+    )
+    return null
+  }
+
+  return configRows[0]
+}
+
+// ============================================================
+// Coexistence (WhatsApp Business app + Cloud API on one number)
+// ============================================================
+
+/**
+ * Messages the business typed in the WhatsApp Business app. Stored as
+ * agent messages so the CRM thread shows both sides. They never bump
+ * unread, never fire automations / AI / message.received (the business
+ * wrote them), but they do pause an active Flow run — a human replying
+ * from the phone is the same "yield, human is here" signal as an
+ * inbox send.
+ */
+async function handleMessageEchoes(
+  echoes: WhatsAppEchoMessage[],
+  config: WhatsAppConfigRow
+) {
+  if (echoes.length === 0) return
+  const accessToken = decrypt(config.access_token)
+  const mirrorMedia = config.mirror_inbound_media !== false
+
+  for (const echo of echoes) {
+    await processMessageEcho(
+      echo,
+      config.account_id,
+      config.user_id,
+      accessToken,
+      mirrorMedia
+    )
+  }
+}
+
+async function processMessageEcho(
+  echo: WhatsAppEchoMessage,
+  accountId: string,
+  configOwnerUserId: string,
+  accessToken: string,
+  mirrorMedia: boolean
+) {
+  // The customer is the RECIPIENT of an echo.
+  const identity = resolveInboundIdentity(
+    customerIdentityPayload(echo.to, echo.to_user_id)
+  )
+  if (!echo.id || !hasUsableIdentity(identity)) {
+    console.error(
+      '[webhook] message echo carries no id or recipient; skipping:',
+      echo.id
+    )
+    return
+  }
+
+  // Reactions are per-(target, actor) state keyed on a team member;
+  // a reaction tapped on the phone has no member to attribute it to.
+  if (echo.type === 'reaction') return
+
+  const contactOutcome = await findOrCreateContact(
+    accountId,
+    configOwnerUserId,
+    identity
+  )
+  if (!contactOutcome) return
+  const contactId = contactOutcome.contact.id
+
+  const convResult = await findOrCreateConversation(
+    accountId,
+    configOwnerUserId,
+    contactId
+  )
+  if (!convResult) return
+  const conversation = convResult.conversation
+
+  if (convResult.created) {
+    await dispatchWebhookEvent(supabaseAdmin(), accountId, 'conversation.created', {
+      conversation_id: conversation.id,
+      contact_id: contactId,
+    })
+  }
+
+  const { contentText, mediaUrl, mediaType } = await parseMessageContent(
+    echo,
+    accessToken,
+    mirrorMedia ? { accountId } : null
+  )
+
+  let replyToInternalId: string | null = null
+  if (echo.context?.id) {
+    replyToInternalId = await lookupInternalIdByMetaId(
+      echo.context.id,
+      conversation.id
+    )
+  }
+
+  const createdAt = metaTimestampToIso(echo.timestamp)
+
+  // Idempotent on (conversation_id, message_id), same as inbound — Meta
+  // retries deliveries, and a history chunk can repeat an echo.
+  const { data: insertedRows, error: msgError } = await supabaseAdmin()
+    .from('messages')
+    .upsert(
+      {
+        conversation_id: conversation.id,
+        sender_type: 'agent',
+        content_type: storedContentType(echo.type),
+        content_text: contentText,
+        media_url: mediaUrl,
+        media_type: mediaType,
+        message_id: echo.id,
+        status: 'sent',
+        created_at: createdAt,
+        reply_to_message_id: replyToInternalId,
+      },
+      { onConflict: 'conversation_id,message_id', ignoreDuplicates: true }
+    )
+    .select('id')
+
+  if (msgError) {
+    console.error('Error inserting message echo:', msgError)
+    return
+  }
+  if (!insertedRows || insertedRows.length === 0) return // replay
+
+  const { error: convError } = await supabaseAdmin()
+    .from('conversations')
+    .update({
+      last_message_text: contentText || `[${echo.type}]`,
+      last_message_at: createdAt,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', conversation.id)
+  if (convError) {
+    console.error('Error updating conversation for message echo:', convError)
+  }
+
+  // Same pause as send-message.ts's agent send. Best-effort.
+  try {
+    const { error: pauseErr } = await supabaseAdmin()
+      .from('flow_runs')
+      .update({
+        status: 'paused_by_agent',
+        ended_at: new Date().toISOString(),
+        end_reason: 'agent_replied',
+      })
+      .eq('account_id', accountId)
+      .eq('contact_id', contactId)
+      .eq('status', 'active')
+    if (pauseErr) {
+      console.error('[flows] pause-on-app-reply failed:', pauseErr.message)
+    }
+  } catch (err) {
+    console.error(
+      '[flows] pause-on-app-reply threw:',
+      err instanceof Error ? err.message : err
+    )
+  }
+}
+
+/**
+ * Past 1:1 chats from the WhatsApp Business app, delivered in chunks
+ * after onboarding. Imported quietly: no unread bump, no automations,
+ * AI, flows or public webhooks — these are old messages, and replaying
+ * six months of them as "new" would spam every downstream consumer.
+ *
+ * Media is NOT downloaded here: a chunk can carry hundreds of files and
+ * must finish inside this route's maxDuration. The lazy proxy path
+ * (`/api/whatsapp/media/<id>`) fetches a file only when it's opened.
+ */
+async function handleHistory(
+  chunks: WhatsAppHistoryChunk[],
+  businessPhone: string | undefined,
+  config: WhatsAppConfigRow
+) {
+  for (const chunk of chunks) {
+    if (chunk.errors?.length) {
+      for (const err of chunk.errors) {
+        if (err.code === HISTORY_SHARING_DECLINED) {
+          console.warn(
+            '[webhook] chat history was not shared: history sharing is turned off in the WhatsApp Business app'
+          )
+        } else {
+          console.warn(
+            `[webhook] history sync error [${err.code}] ${err.title}` +
+              (err.error_data?.details ? ` — ${err.error_data.details}` : '')
+          )
+        }
+      }
+      continue
+    }
+
+    for (const thread of chunk.threads ?? []) {
+      await importHistoryThread(thread, businessPhone, config)
+    }
+
+    if (chunk.metadata) {
+      console.info(
+        `[webhook] history chunk imported: phase ${chunk.metadata.phase ?? '?'}, ` +
+          `chunk ${chunk.metadata.chunk_order ?? '?'}, progress ${chunk.metadata.progress ?? '?'}%`
+      )
+    }
+  }
+}
+
+async function importHistoryThread(
+  thread: { id: string; messages?: WhatsAppHistoryMessage[] },
+  businessPhone: string | undefined,
+  config: WhatsAppConfigRow
+) {
+  // Reactions need a target row and an actor; skip them in history.
+  const messages = (thread.messages ?? []).filter(
+    (m) => m.id && m.type !== 'reaction'
+  )
+  if (messages.length === 0) return
+
+  const identity = resolveInboundIdentity(customerIdentityPayload(thread.id))
+  if (!hasUsableIdentity(identity)) {
+    console.error('[webhook] history thread has no usable customer id; skipping')
+    return
+  }
+
+  const contactOutcome = await findOrCreateContact(
+    config.account_id,
+    config.user_id,
+    identity
+  )
+  if (!contactOutcome) return
+
+  const convResult = await findOrCreateConversation(
+    config.account_id,
+    config.user_id,
+    contactOutcome.contact.id
+  )
+  if (!convResult) return
+  const conversation = convResult.conversation
+
+  const rows: Record<string, unknown>[] = []
+  let newest: { at: string; text: string } | null = null
+  for (const m of messages) {
+    const sentByBusiness = isSentByBusiness(m, businessPhone)
+    const { contentText, mediaUrl, mediaType } = await parseMessageContent(
+      m,
+      '', // no Meta call: media stays lazy (see handleHistory)
+      null,
+      { lazyMedia: true }
+    )
+    const createdAt = metaTimestampToIso(m.timestamp)
+    rows.push({
+      conversation_id: conversation.id,
+      sender_type: sentByBusiness ? 'agent' : 'customer',
+      content_type: storedContentType(m.type),
+      content_text: contentText,
+      media_url: mediaUrl,
+      media_type: mediaType,
+      message_id: m.id,
+      status: historyMessageStatus(m.history_context?.status, sentByBusiness),
+      created_at: createdAt,
+    })
+    if (!newest || createdAt > newest.at) {
+      newest = { at: createdAt, text: contentText || `[${m.type}]` }
+    }
+  }
+
+  // One round trip per thread; replays and overlaps with live
+  // deliveries are dropped by the (conversation_id, message_id) index.
+  const { error: msgError } = await supabaseAdmin()
+    .from('messages')
+    .upsert(rows, {
+      onConflict: 'conversation_id,message_id',
+      ignoreDuplicates: true,
+    })
+  if (msgError) {
+    console.error('Error importing history messages:', msgError)
+    return
+  }
+
+  // Only move the inbox preview forward — history is older than any
+  // live message that may already be in the thread.
+  if (newest) {
+    const { error: convError } = await supabaseAdmin()
+      .from('conversations')
+      .update({
+        last_message_text: newest.text,
+        last_message_at: newest.at,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', conversation.id)
+      .or(`last_message_at.is.null,last_message_at.lt.${newest.at}`)
+    if (convError) {
+      console.error('Error updating conversation after history import:', convError)
+    }
+  }
+}
+
+/**
+ * The WhatsApp Business app's address book. Adds a CRM contact for a
+ * number we don't know yet; never overwrites an existing contact's name
+ * (the CRM's edit wins) and never deletes on `remove` — removing a
+ * phone contact must not erase the CRM's history with them.
+ */
+async function handleStateSync(
+  items: WhatsAppStateSyncItem[],
+  config: WhatsAppConfigRow
+) {
+  for (const item of items) {
+    if (item.type !== 'contact') continue
+    if (item.action?.toLowerCase() === 'remove') continue
+
+    const phone = normalizePhone(item.contact?.phone_number ?? '')
+    if (!phone) continue
+
+    const existing = await findExistingContact(
+      supabaseAdmin(),
+      config.account_id,
+      phone
+    )
+    if (existing) continue
+
+    const { error } = await supabaseAdmin()
+      .from('contacts')
+      .insert({
+        account_id: config.account_id,
+        user_id: config.user_id,
+        phone,
+        name: stateSyncContactName(item.contact, phone),
+      })
+    // A unique violation means a concurrent delivery created it first.
+    if (error && !isUniqueViolation(error)) {
+      console.error('[webhook] address-book contact insert failed:', error.message)
     }
   }
 }
@@ -747,22 +1162,8 @@ async function processMessage(
   //   media_url, media_type, template_name, message_id, status,
   //   created_at
 
-  // The messages.content_type CHECK constraint (widened in migration 010
-  // to add 'interactive' for button/list taps) allows:
-  //   text, image, document, audio, video, location, template, interactive
-  // Map incoming WhatsApp types that aren't in that list to the closest
-  // allowed value so the INSERT doesn't fail with a constraint error.
-  const ALLOWED_CONTENT_TYPES = new Set([
-    'text', 'image', 'document', 'audio', 'video',
-    'location', 'template', 'interactive',
-  ])
-  const contentType = ALLOWED_CONTENT_TYPES.has(message.type)
-    ? message.type
-    : message.type === 'sticker'
-      ? 'image'         // stickers are images
-      : message.type === 'button'
-        ? 'interactive' // template quick-reply tap (issue #478)
-        : 'text'        // reaction, unknown → text fallback
+  // Map onto the messages.content_type CHECK (see storedContentType).
+  const contentType = storedContentType(message.type)
 
   // Determine whether this is the contact's very first inbound message
   // BEFORE we insert, so the count is accurate. Covers the case where
@@ -992,7 +1393,10 @@ async function parseMessageContent(
   accessToken: string,
   // Tenancy + opt-out for the media mirror. Null disables mirroring
   // entirely, which is what the account-level toggle does.
-  mirror: { accountId: string } | null
+  mirror: { accountId: string } | null,
+  // lazyMedia: skip the Meta lookup and store the proxy path, which
+  // fetches the file only when it's opened. Used for history imports.
+  options: { lazyMedia?: boolean } = {}
 ): Promise<{
   contentText: string | null
   mediaUrl: string | null
@@ -1027,6 +1431,7 @@ async function parseMessageContent(
     mediaId: string,
     fileName?: string | null
   ): Promise<string | null> => {
+    if (options.lazyMedia) return `/api/whatsapp/media/${mediaId}`
     try {
       const info = await getMediaUrl({ mediaId, accessToken })
 
